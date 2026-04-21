@@ -34,271 +34,6 @@ from Online_simulation_synthesizing.Online_simulation_synthesizing_subjects impo
       Online_simulation_synthesizing_results_linear, Online_simulation_synthesizing_results_comparison_linear, Online_simulation_synthesizing_results_linear_perclass, Online_simulation_synthesizing_results_2cls_linear,\
       Online_simulation_synthesizing_results_comparison_linear_2cls, Online_simulation_synthesizing_results_polynomial, Online_simulation_synthesizing_results_comparison_polynomial, Online_simulation_synthesizing_results_comparison_polynomial_optimized, Online_simulation_synthesizing_results_polynomial_avg, Online_simulation_synthesizing_results_polynomial_avgF1,Online_simulation_synthesizing_results_comparison_polynomial_optimized_perclass, Online_simulation_synthesizing_results_calibration_avg, Online_simulation_synthesizing_results_calibration_perclass, Online_simulation_synthesizing_results_polynomial_avgF1_noRest, Online_simulation_synthesizing_results_polynomial_avgF1_Rest
 
-# ── BG-SPCL additions ────────────────────────────────────────────────────────
-from scipy.fft import fft, fftfreq
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# BG-SPCL Core Functions
-# Choi et al., "Brain-Guided Self-Paced Curriculum Learning for Adaptive
-# Human-Machine Interfaces", IEEE TSMC, 2025.
-# Source: https://github.com/yeonoi3488/bg-spcl
-# ══════════════════════════════════════════════════════════════════════════════
-
-def bg_compute_scores(X, sampling_rate, trial_len):
-    """
-    Compute normalised Alpha/Theta ratio (ATr) distraction score per EEG trial.
-    Adapted from bg_spcl/bg.py: compute_bg_scores().
-
-    Parameters
-    ----------
-    X            : np.ndarray (N_trials, N_channels, T_timepoints)
-    sampling_rate: int   — Hz, e.g. 200
-    trial_len    : int   — seconds, e.g. 4  → extracts segments [1s,2s), [2s,3s), [3s,4s)
-
-    Returns
-    -------
-    scores : np.ndarray (N_trials,) in [0,1]; higher = more distracted = lower quality
-    """
-    freqs     = fftfreq(sampling_rate, 1.0 / sampling_rate)
-    alpha_idx = (freqs >= 8)  & (freqs < 13)
-    theta_idx = (freqs >= 4)  & (freqs < 8)
-
-    scores_per_trial = []
-    for trial in X:                                        # trial: (C, T)
-        seg_scores = []
-        for s in range(trial_len - 1):
-            seg = trial[:, (s + 1) * sampling_rate : (s + 2) * sampling_rate]
-            if seg.shape[1] < sampling_rate:
-                continue
-            psd         = np.abs(fft(seg)) ** 2           # (C, sampling_rate)
-            alpha_power = float(np.mean(psd[:, alpha_idx]))
-            theta_power = float(np.mean(psd[:, theta_idx]))
-            seg_scores.append(alpha_power / theta_power if theta_power > 1e-10 else 0.0)
-        scores_per_trial.append(float(np.mean(seg_scores)) if seg_scores else 0.0)
-
-    scores = np.array(scores_per_trial, dtype=np.float32)
-    s_min, s_max = scores.min(), scores.max()
-    return (scores - s_min) / (s_max - s_min) if (s_max - s_min) > 1e-10 else np.zeros_like(scores)
-
-
-def bg_compute_scores_window(X, sampling_rate):
-    """
-    ATr distraction score for WINDOW-level input.
-    Replaces bg_compute_scores when X contains windows (not full trials).
-    Computes FFT directly on the entire window instead of 1-second segments.
-
-    X : np.ndarray (N_windows, C, T_window)
-    """
-    freqs     = fftfreq(X.shape[-1], 1.0 / sampling_rate)
-    alpha_idx = (freqs >= 8)  & (freqs < 13)
-    theta_idx = (freqs >= 4)  & (freqs < 8)
-
-    scores = []
-    for window in X:                            # window: (C, T_window)
-        psd         = np.abs(fft(window)) ** 2  # (C, T_window)
-        alpha_power = float(np.mean(psd[:, alpha_idx]))
-        theta_power = float(np.mean(psd[:, theta_idx]))
-        scores.append(alpha_power / theta_power if theta_power > 1e-10 else 0.0)
-
-    scores = np.array(scores, dtype=np.float32)
-    s_min, s_max = scores.min(), scores.max()
-    return (scores - s_min) / (s_max - s_min) if (s_max - s_min) > 1e-10 else np.zeros_like(scores)
-
-def bg_spcl_offline_train(X, y, model, optimizer, criterion, device,
-                          init_lambda=0.125, spcl_lr=0.05, spcl_round=19,
-                          k=3.0, sampling_rate=200, trial_len=4):
-    """
-    One offline BG-SPCL training call (replaces train_one_epoch_fea for the whole epoch).
-    Adapted from bg_spcl/spcl.py: main_spcl() + sample_align().
-
-    Steps:
-      1. Compute ATr distraction scores.
-      2. Tukey masking: discard trials with score > Q3 + k*IQR.
-      3. SPL inner loop (spcl_round iterations):
-           - Forward pass → proxy difficulty = 1 - p_max * acc_sign
-           - Per-class sort ascending (easy first)
-           - Select top-λ fraction  (λ = init_lambda + spcl_lr * r, capped at 1.0)
-           - Backward on selected samples only
-
-    Parameters
-    ----------
-    X, y         : np.ndarray (N, C, T) and (N,) — CPU numpy arrays
-    model        : nn.Module already on device, must return (logits, features)
-    init_lambda  : float — starting fraction of easy samples (paper default 0.125)
-    spcl_lr      : float — λ increment per round (paper default 0.05)
-    spcl_round   : int   — inner SPL iterations per call (paper default 19)
-    k            : float — Tukey fence constant (paper default 3.0)
-    sampling_rate: int   — Hz
-    trial_len    : int   — seconds
-    """
-    # ── 1. BG scores ──────────────────────────────────────────────────────────
-    scores = bg_compute_scores_window(X, sampling_rate)
-
-    # ── 2. Tukey masking ──────────────────────────────────────────────────────
-    Q1, Q3 = np.percentile(scores, 25), np.percentile(scores, 75)
-    mask   = scores <= (Q3 + k * (Q3 - Q1))
-    print(f'  [BG offline] Tukey removed {(~mask).sum()}/{len(mask)} trials  '
-          f'(k={k}, threshold={Q3 + k*(Q3-Q1):.4f})')
-    X_m, y_m = X[mask], y[mask]
-    if len(X_m) == 0:
-        print('  [BG offline] All samples filtered — skipping.')
-        return
-
-    X_t = torch.tensor(X_m.astype(np.float32)).to(device)   # (M, C, T)
-    y_t = torch.tensor(y_m.astype(np.int64)).to(device)      # (M,)
-
-    # ── 3. SPL inner loop ─────────────────────────────────────────────────────
-    model.train()
-    for r in range(spcl_round):
-        with torch.no_grad():
-            logits, _ = model(X_t)
-            probs     = torch.softmax(logits, dim=1)         # (M, C)
-
-        p_max, pred = probs.max(dim=1)
-        acc_sign    = torch.where(pred == y_t,
-                                  torch.ones_like(p_max),
-                                  -torch.ones_like(p_max))
-        difficulty  = 1.0 - p_max * acc_sign                 # low = easy
-
-        lam = min(init_lambda + spcl_lr * r, 1.0)
-        sel = []
-        for lbl in torch.unique(y_t).cpu().numpy():
-            cls_idx  = (y_t == int(lbl)).nonzero(as_tuple=True)[0]
-            order    = torch.argsort(difficulty[cls_idx])    # ascending
-            n_pick   = max(1, int(len(cls_idx) * lam))
-            sel.append(cls_idx[order[:n_pick]])
-        if not sel:
-            continue
-        sel_idx = torch.cat(sel)
-
-        logits_sel, _ = model(X_t[sel_idx])
-        loss = criterion(logits_sel, y_t[sel_idx])
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-    model.eval()
-    print(f'  [BG-SPCL offline] {spcl_round} SPL rounds on {len(X_m)} trials.')
-
-
-def bg_spcl_batch_update(X_buf, model, optimizer, device,
-                         num_classes=3, init_lambda=0.125, spcl_lr=0.05,
-                         k=3.0, sampling_rate=200, trial_len=4,
-                         infer_batch_size=64):
-    """
-    Online Batch BG-SPCL update — Algorithm 1 lines 11-24 (Choi et al., 2025).
-    Missing from the original repo; implemented here.
-
-    Uses SELF-ENTROPY as difficulty (no ground-truth labels):
-        H(x) = -1/log(C) * Σ_k δ_k * log(δ_k)
-    Low entropy = confident prediction = easy sample (selected first).
-    Model minimises self-entropy of selected samples → sharpens predictions.
-
-    GPU memory strategy: gradient accumulation.
-      - X_m is kept on CPU at all times.
-      - Inference (entropy computation) is done in chunks of infer_batch_size.
-      - Backward uses gradient accumulation: loss.sum() over all mini-batches,
-        then divide gradients by total count → exactly equivalent to one full-batch
-        backward, while keeping peak GPU memory bounded by infer_batch_size.
-
-    Parameters
-    ----------
-    X_buf           : np.ndarray (Nb, C, T) — memory buffer B (CPU numpy)
-    model           : nn.Module on device, returns (logits, features)
-    num_classes     : int
-    infer_batch_size: int — GPU chunk size. Tune to GPU memory:
-                      4GB → 32, 8GB → 64, 12GB → 128
-    """
-    if len(X_buf) == 0:
-        print('  [BG-SPCL online] Empty buffer — skipping.')
-        return
-
-    # ── 1. BG masking (CPU only, no GPU memory used) ─────────────────────────
-    scores = bg_compute_scores_window(X_buf, sampling_rate)
-    Q1, Q3 = np.percentile(scores, 25), np.percentile(scores, 75)
-    mask   = scores <= (Q3 + k * (Q3 - Q1))
-    print(f'  [BG online] Tukey removed {(~mask).sum()}/{len(mask)} samples.')
-    X_m = X_buf[mask]          # stays on CPU throughout
-    if len(X_m) == 0:
-        print('  [BG-SPCL online] All samples filtered — skipping.')
-        return
-
-    print(f'  [BG-SPCL online] {len(X_m)} samples after masking '
-          f'(infer_batch_size={infer_batch_size}).')
-
-    log_C = float(np.log(num_classes + 1e-10))
-
-    def batched_entropy(X_np):
-        """
-        Compute self-entropy H for every sample in X_np.
-        Runs inference in chunks of infer_batch_size to bound GPU memory.
-        Returns H as a CPU float tensor of shape (N,).
-        """
-        H_list = []
-        model.eval()
-        with torch.no_grad():
-            for start in range(0, len(X_np), infer_batch_size):
-                chunk = torch.tensor(
-                    X_np[start : start + infer_batch_size].astype(np.float32)
-                ).to(device)
-                logits, _ = model(chunk)
-                probs = torch.softmax(logits, dim=1)
-                H = -(probs * torch.log(probs + 1e-8)).sum(dim=1) / log_C
-                H_list.append(H.cpu())
-                del chunk, logits, probs, H        # release GPU memory immediately
-        return torch.cat(H_list)                   # (N,) on CPU
-
-    # ── 2. while λ < 1: alternating optimisation ─────────────────────────────
-    model.train()
-    lam, rnd = init_lambda, 0
-    while lam < 1.0:
-
-        # Step a: fix θ → select easy samples by self-entropy (batched, no grad)
-        H       = batched_entropy(X_m)                     # (N,) CPU
-        n_pick  = max(1, int(len(X_m) * lam))
-        _, easy = torch.topk(H, n_pick, largest=False)     # low-H = easy
-        easy_np = easy.numpy()                             # CPU numpy indices
-
-        # Step b: fix w* → update θ using gradient accumulation
-        # Equivalent to one full-batch backward on all easy samples,
-        # but processes infer_batch_size samples at a time to avoid OOM.
-        model.train()
-        optimizer.zero_grad()
-        n_easy = len(easy_np)
-
-        for start in range(0, n_easy, infer_batch_size):
-            idx_chunk = easy_np[start : start + infer_batch_size]
-            chunk_t   = torch.tensor(
-                X_m[idx_chunk].astype(np.float32)).to(device)
-
-            logits_sel, _ = model(chunk_t)
-            probs_sel     = torch.softmax(logits_sel, dim=1)
-            H_sel = -(probs_sel * torch.log(probs_sel + 1e-8)).sum(dim=1) / log_C
-
-            # Use .sum() (not .mean()) so gradients accumulate correctly.
-            # Dividing by n_easy afterwards makes it equivalent to .mean() over
-            # the full easy set — i.e. one single full-batch gradient update.
-            loss = H_sel.sum() / n_easy
-            loss.backward()                    # accumulate gradients, do NOT zero_grad
-
-            del chunk_t, logits_sel, probs_sel, H_sel, loss   # release GPU memory
-
-        optimizer.step()                       # one single parameter update
-
-        # Algorithm 1 line 20 then 19: increment round first, then update λ
-        rnd += 1
-        lam += rnd * spcl_lr
-
-    model.eval()
-    print(f'  [BG-SPCL online batch] {rnd} rounds on {len(X_m)} samples.')
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# End BG-SPCL Core Functions
-# ══════════════════════════════════════════════════════════════════════════════
-
 
 #for personal model, save the test prediction of each cv fold
 def Offline_EEGNet_simulation(args_dict):
@@ -320,14 +55,6 @@ def Offline_EEGNet_simulation(args_dict):
     unfreeze_encoder_offline = args_dict.unfreeze_encoder_offline
     unfreeze_encoder_online = args_dict.unfreeze_encoder_online
     patience = args_dict.patience
-    # ── BG-SPCL offline params ───────────────────────────────────────────────────────
-    bg_init_lambda   = getattr(args_dict, 'bg_init_lambda',   0.125)
-    bg_spcl_lr       = getattr(args_dict, 'bg_spcl_lr',       0.05)
-    bg_spcl_round    = getattr(args_dict, 'bg_spcl_round',    19)
-    bg_k             = getattr(args_dict, 'bg_k',             3.0)
-    bg_sampling_rate = getattr(args_dict, 'bg_sampling_rate', 200)
-    bg_trial_len     = getattr(args_dict, 'bg_trial_len',     4)
-    # ─────────────────────────────────────────────────────────────────────────
     
     #GPU setting
     cuda = torch.cuda.is_available()
@@ -422,20 +149,7 @@ def Offline_EEGNet_simulation(args_dict):
             epochs_no_improve = 0
 
             for epoch in trange(n_epoch_offline, desc='1-fold cross validation'):
-                # ── BG-SPCL offline: replaces standard one-epoch train ─────────────
-                bg_spcl_offline_train(
-                    sub_train_feature_array,   # (N, C, T) numpy, matches your data format
-                    sub_train_label_array,     # (N,)      numpy
-                    model, optimizer, criterion, device,
-                    init_lambda   = bg_init_lambda,
-                    spcl_lr       = bg_spcl_lr,
-                    spcl_round    = bg_spcl_round,
-                    k             = bg_k,
-                    sampling_rate = bg_sampling_rate,
-                    trial_len     = bg_trial_len,
-                )
-                average_loss_this_epoch = 0.0  # BG-SPCL updates internally; placeholder for curve logging
-                # ─────────────────────────────────────────────────────────────
+                average_loss_this_epoch = train_one_epoch_fea(model, optimizer, criterion, sub_cv_train_loader, device)
                 val_accuracy, _, _, _, _, accuracy_per_class = eval_model_confusion_matrix_fea(model, sub_cv_val_loader, device)
                 train_accuracy, _, _ , _ = eval_model_fea(model, sub_cv_train_loader, device)
 
@@ -514,40 +228,6 @@ def Online_updating_EEGNet_simulation(args_dict):
     T_distil = args_dict.T_distil
     tau_cons = args_dict.tau_cons
     queue_size = args_dict.queue_size
-    # ── BG-SPCL online params ────────────────────────────────────────────────────────
-    bg_init_lambda   = getattr(args_dict, 'bg_init_lambda',   0.125)
-    bg_spcl_lr       = getattr(args_dict, 'bg_spcl_lr',       0.05)
-    bg_k             = getattr(args_dict, 'bg_k',             3.0)
-    bg_sampling_rate = getattr(args_dict, 'bg_sampling_rate', 200)
-    bg_trial_len     = getattr(args_dict, 'bg_trial_len',     4)
-    bg_update_trial  = getattr(args_dict, 'bg_update_trial',  update_wholeModel)
- 
- 
-    # ── Algorithm 1, line 2: Initialise memory buffer B with Dtrain ──────────
-    # B stores high-confidence pseudo-labelled online samples + replayed Dtrain.
-    # Initialised here with offline training data (true labels).
-    # nb  : incremental mini-batch size (reuse batch_size_online)
-    # r   : memory replay ratio (proportion of nb filled with Dtrain samples)
-    # ── Incremental Update 控制参数（对应论文 Algorithm 1 第 4-10 行）────────
-    # 忠实还原原仓库设计：
-    #   滑动窗口维护最近 _nb_incre 步的 batch 数据（每步 batch_size_online 个窗口）
-    #   对窗口内所有样本推理 → 按置信度降序排列 → 取前 _n_online 个作为在线训练样本
-    #   同时从 Dtrain 随机取 _n_replay 个真实标注样本做 memory replay
-    #   两者混合 → CE 损失更新（对应论文式 11）
-    _nb_incre     = 8                       # 滑动窗口大小（trial数），对应论文 nb=8
-    _r_replay     = 0.9                      # 离线样本比例，对应论文 r
-    _conf_thr     = 0.7                      # 置信度阈值：超过此值才存入 buffer B
-    _incre_stride = 8                        # 每步都触发增量更新
-    # 滑动窗口总窗口数 = nb个trial × 每个trial的窗口数
-    _window_total = _nb_incre * batch_size_online                # = 8*9 = 72 个窗口
-    # 在线样本数：从 72 个窗口中取置信度最高的前 window_total*(1-r) 个
-    _n_online     = max(1, int(_window_total * (1 - _r_replay))) # = int(72*0.1) = 7
-    # 离线样本数：同样以 window_total 为基准，按 r 比例取
-    _n_replay     = int(_window_total * _r_replay)               # = int(72*0.9) = 64
-    # Note: _n_replay will be capped after sub_train_label_array is loaded below
-    # 滑动窗口 list，最多保存 _nb_incre 个 trial 的 batch
-    _sliding_window_X = []                   # 每个元素 shape: (batch_size_online, C, T)
-    # ─────────────────────────────────────────────────────────────────────────
 
     #GPU setting
     cuda = torch.cuda.is_available()
@@ -573,8 +253,6 @@ def Online_updating_EEGNet_simulation(args_dict):
 
     sub_train_feature_array = sub_train_feature_array.astype(np.float32)
     sub_val_feature_array = sub_val_feature_array.astype(np.float32)
-    # Cap _n_replay to Dtrain size now that sub_train_label_array is defined
-    _n_replay = min(_n_replay, len(sub_train_label_array))
     sub_train_feature_array_1 = sub_train_feature_array_1.astype(np.float32)
 
     match = re.search(r"lr(\d+\.\d+)_dropout(\d+\.\d+)", restore_file)
@@ -663,29 +341,20 @@ def Online_updating_EEGNet_simulation(args_dict):
     accuracies_per_class_iterations_Rest = []
     accuracies_per_class_iterations_Rest.append([0, accuracy_per_class_init[0]])  # saving the existing initial caliberation accuracy for class 0
     
-    # using a FIFO queue to save the latest queue_size num of data for model updating for TTA method
-    feature_queue = deque(maxlen=queue_size)
 
-    # ── Algorithm 1, line 2: Initialise memory buffer B with Dtrain ──────────
-    memory_B_X = sub_train_feature_array.copy()   # (N_train, C, T)  true labels
-    memory_B_y = sub_train_label_array.copy()     # (N_train,)
-    # ─────────────────────────────────────────────────────────────────────────
-    # Initialise optimizer before the online loop (used by both Incremental and Batch Update)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
-    # this is the implementation of the 
-    # paper: 
+    # this is the implementation of paper
+    # Ding, Y., Udompanyawit, C., Zhang, Y., & He, B. (2025). EEG-based brain-computer interface enables real-time robotic hand control at individual finger level. Nature communications, 16(1), 5401. https://doi.org/10.1038/s41467-025-61064-x
     for trial_idx in range(trial_nums):
         # generate the new data, simulating the online experiment 
         sub_train_feature_batches = sub_train_feature_array_1[trial_idx * batch_size_online : (trial_idx + 1) * batch_size_online, :, :]
         sub_train_label_batches = sub_train_label_array_1[trial_idx * batch_size_online : (trial_idx + 1) * batch_size_online]
         
-        # Add data to the FIFO queue (kept for compatibility)
-        feature_queue.append(sub_train_feature_batches)
 
         # online simulation trials
         print("********** Online simulation trial: {} ***********".format(trial_idx))
         start_time_infer = time.time()
+        if (trial_idx+1) > update_trial:
+            model.load_state_dict(torch.load(os.path.join(result_save_subject_checkpointdir, 'best_model.pt')))  
 
         model = model.to(device)
         # online testing of the MI class
@@ -721,130 +390,29 @@ def Online_updating_EEGNet_simulation(args_dict):
             print(accuracy_per_class_iter)
             accuracy_per_class_iter_Rest = compute_total_accuracy_per_class(accuracies_per_class_iterations_Rest)
 
-        # ── Algorithm 1, lines 4-10: Incremental Update ───────────────────────
-        # Design: faithful to original bg-spcl repo (sliding window + confidence selection)
-        #   Step 1: maintain a sliding window of the last _nb_incre batches
-        #   Step 2: run inference on ALL samples in the window → rank by confidence
-        #   Step 3: top-_n_online high-confidence → online training samples (pseudo-labels)
-        #           also store them to buffer B if conf > _conf_thr  (Line 7, for Batch Update)
-        #   Step 4: randomly sample _n_replay from Dtrain → replay samples (true labels)
-        #   Step 5: combine online + replay → CE loss → optimizer.step()  (Eq. 11)
-
-        # Update sliding window (keep last _nb_incre batches)
-        _sliding_window_X.append(sub_train_feature_batches.copy())
-        if len(_sliding_window_X) > _nb_incre:
-            _sliding_window_X.pop(0)
-
-        if (trial_idx + 1) % _incre_stride == 0 and len(_sliding_window_X) == _nb_incre:
-
-            # Concatenate sliding window → (nb * batch_size_online, C, T)
-            X_window    = np.concatenate(_sliding_window_X, axis=0)
-            X_window_t  = torch.tensor(X_window.astype(np.float32)).to(device)
-
-            # Line 6: run inference on all window samples → confidence + pseudo-labels
-            model.eval()
-            with torch.no_grad():
-                logits_win, _ = model(X_window_t)
-                probs_win     = torch.softmax(logits_win, dim=1)
-                conf_win, pseudo_win = probs_win.max(dim=1)   # (nb*batch_size_online,)
-
-            # Line 7: store HIGH-CONFIDENCE samples into buffer B
-            # B is used by Batch Update (lines 11-24), NOT directly for training here.
-            high_conf_mask = conf_win.cpu().numpy() > _conf_thr
-            if high_conf_mask.sum() > 0:
-                memory_B_X = np.concatenate(
-                    [memory_B_X, X_window[high_conf_mask]], axis=0)
-                memory_B_y = np.concatenate(
-                    [memory_B_y, pseudo_win.cpu().numpy()[high_conf_mask]], axis=0)
-
-            # Select top-_n_online samples by confidence (descending) as online portion
-            # This mirrors the original repo's: indices[:int(buffer_size - replay_ratio)]
-            _, top_conf_idx = torch.topk(conf_win, _n_online, largest=True)
-            top_conf_idx_np = top_conf_idx.cpu().numpy()
-            X_online_sel    = X_window[top_conf_idx_np]                    # (_n_online, C, T)
-            y_online_sel    = pseudo_win.cpu().numpy()[top_conf_idx_np]    # (_n_online,)
-
-            # Line 8: class-balanced replay from Dtrain (_n_replay // n_cls per class)
-            _replay_classes = np.unique(sub_train_label_array)
-            _n_cls          = len(_replay_classes)
-            _n_per_cls      = max(1, _n_replay // _n_cls)
-            r_idx_list = []
-            for _cls in _replay_classes:
-                _cls_idx = np.where(sub_train_label_array == _cls)[0]
-                r_idx_list.append(
-                    np.random.choice(_cls_idx, _n_per_cls, replace=len(_cls_idx) < _n_per_cls))
-            r_idx    = np.concatenate(r_idx_list)
-            X_replay = sub_train_feature_array[r_idx]   # (_n_per_cls*n_cls, C, T)  true labels
-            y_replay = sub_train_label_array[r_idx]     # (_n_per_cls*n_cls,)
-
-            # Line 9: combined batch = online (pseudo) + replay (true) → Eq. (11) CE loss
-            X_incre   = np.concatenate([X_online_sel, X_replay], axis=0)
-            y_incre   = np.concatenate([y_online_sel, y_replay],  axis=0)
-            X_incre_t = torch.tensor(X_incre.astype(np.float32)).to(device)
-            y_incre_t = torch.tensor(y_incre.astype(np.int64)).to(device)
-
-            model_k = copy.deepcopy(model)
-
-            model.train()
-            optimizer.zero_grad()                        # reuse outer optimizer (preserve Adam momentum)
-            logits_incre, _ = model(X_incre_t)
-            loss_incre = nn.CrossEntropyLoss()(logits_incre, y_incre_t)
-            loss_incre.backward()
-            optimizer.step()
-
-            # Momentum update for the model parameters (same as T-TIME)
-            with torch.no_grad():
-                for param_q, param_k in zip(model.parameters(), model_k.parameters()):
-                    param_k.data = param_k.data * para_m + param_q.data * (1. - para_m)
-            model = copy.deepcopy(model_k)
-            model.eval()
-
-            print(f'  [BG-SPCL incre] trial {trial_idx}: '
-                  f'window={len(X_window)}, online(top-conf)={_n_online}, '
-                  f'replay={_n_replay}, '
-                  f'loss={loss_incre.item():.4f}, buf_B={len(memory_B_y)}')
-        # ── end Incremental Update ─────────────────────────────────────────────
-
-        # ── BG-SPCL Scheme C: online batch update (Algorithm 1, lines 11-24) ──
-        # Triggered every bg_update_trial trials (aligned with update_wholeModel).
-        if (trial_idx + 1) % bg_update_trial == 0:
-            print(f'******* BG-SPCL online batch update  trial: {trial_idx} *******')
+        # online model updating
+        if (trial_idx + 1) % update_trial == 0:           
+            print("******* Updating the model trial: {} ************".format(trial_idx))
             start_time = time.time()
-
-            experiment_name = 'lr{}_dropout{}'.format(lr, dropout)
+            experiment_name = 'lr{}_dropout{}'.format(lr, dropout)#experiment name: used for indicating hyper setting
+            # print(experiment_name)
+            #derived arg
             result_save_subjectdir = os.path.join(Online_result_save_rootdir, sub_name, experiment_name)
             result_save_subject_checkpointdir = os.path.join(result_save_subjectdir, 'checkpoint')
+
             makedir_if_not_exist(result_save_subjectdir)
             makedir_if_not_exist(result_save_subject_checkpointdir)
 
-            model = model.to(device)
+            # =========================================================================================================
+            # model updating after each session
 
-            # Algorithm 1, line 13: use memory buffer B (not raw session data)
-            # B contains high-confidence pseudo-labelled online samples
-            # plus replayed Dtrain, giving a cleaner curriculum signal.
-            X_buf = memory_B_X.copy()
-
-            bg_spcl_batch_update(
-                X_buf, model, optimizer, device,
-                num_classes      = 3,           # change if your task has ≠ 3 classes
-                init_lambda      = bg_init_lambda,
-                spcl_lr          = bg_spcl_lr,
-                k                = bg_k,
-                sampling_rate    = bg_sampling_rate,
-                trial_len        = bg_trial_len,
-                infer_batch_size = 64,          # 4GB GPU→32, 8GB→64, 12GB→128
-            )
-
-            # Save updated model
-            torch.save(model.state_dict(),
-                       os.path.join(result_save_subject_checkpointdir, 'best_model.pt'))
+            # Saving model
+            torch.save(model.state_dict(), os.path.join(result_save_subject_checkpointdir, 'best_model.pt'))
+            # =========================================================================================================
 
             end_time = time.time()
             total_time = end_time - start_time
             write_program_time(os.path.join(Online_result_save_rootdir, sub_name), total_time)
-            print(f'  BG-SPCL batch update finished in {total_time:.1f}s')
-            
-        # ─────────────────────────────────────────────────────────────────────────
     
     accuracy_save2csv(predict_accuracies, result_save_subjectdir, filename='predict_accuracies.csv', columns=['Accuracy'])
     accuracy_save2csv(class_predictions_arrays, result_save_subjectdir, filename='class_predictions_arrays.csv', columns=['class_predictions_arrays'])
@@ -895,22 +463,6 @@ if __name__ == "__main__":
     parser.add_argument('--model_type', default='EEGNet', type=str, help='the base model to use')
     parser.add_argument('--patience', default=20, type=int, help="the patience for early stopping")
     parser.add_argument('--queue_size', default=4*9, type=int, help="the queue size for the TTA method, should be the same as batch_size_online * num_classes")
-    # ── BG-SPCL hyperparameters ──────────────────────────────────────────────
-    parser.add_argument('--bg_init_lambda',   default=0.125, type=float,
-                        help='BG-SPCL: initial easy-sample fraction per SPL round')
-    parser.add_argument('--bg_spcl_lr',       default=0.05,  type=float,
-                        help='BG-SPCL: lambda increment per SPL round (delta_lambda)')
-    parser.add_argument('--bg_spcl_round',    default=19,    type=int,
-                        help='BG-SPCL: number of SPL iterations per offline epoch call')
-    parser.add_argument('--bg_k',             default=3.0,   type=float,
-                        help='BG-SPCL: Tukey fence constant for distraction filtering')
-    parser.add_argument('--bg_sampling_rate', default=200,   type=int,
-                        help='BG-SPCL: EEG sampling rate in Hz')
-    parser.add_argument('--bg_trial_len',     default=4,     type=int,
-                        help='BG-SPCL: trial length in seconds')
-    parser.add_argument('--bg_update_trial',  default=12,    type=int,
-                        help='BG-SPCL: online batch update every N trials (aligned with update_wholeModel)')
-    # ─────────────────────────────────────────────────────────────────────────
 
     parser.add_argument('--ip', default='172.18.22.21', type=str, help='the IP address')
     parser.add_argument('--port', default=8888, type=int, help='the port')
@@ -950,15 +502,6 @@ if __name__ == "__main__":
     model_type = args.model_type
     patience = args.patience
     queue_size = args.queue_size
-    # ── BG-SPCL ──────────────────────────────────────────────────────────────
-    bg_init_lambda   = args.bg_init_lambda
-    bg_spcl_lr       = args.bg_spcl_lr
-    bg_spcl_round    = args.bg_spcl_round
-    bg_k             = args.bg_k
-    bg_sampling_rate = args.bg_sampling_rate
-    bg_trial_len     = args.bg_trial_len
-    bg_update_trial  = args.bg_update_trial
-    # ─────────────────────────────────────────────────────────────────────────
 
     # save_folder = './Online_DataCollected' + str(sub_name)
     #sanity check:
@@ -1008,15 +551,6 @@ if __name__ == "__main__":
     args_dict.model_type = model_type
     args_dict.patience = patience
     args_dict.queue_size = queue_size
-    # ── BG-SPCL ──────────────────────────────────────────────────────────────
-    args_dict.bg_init_lambda   = bg_init_lambda
-    args_dict.bg_spcl_lr       = bg_spcl_lr
-    args_dict.bg_spcl_round    = bg_spcl_round
-    args_dict.bg_k             = bg_k
-    args_dict.bg_sampling_rate = bg_sampling_rate
-    args_dict.bg_trial_len     = bg_trial_len
-    args_dict.bg_update_trial  = bg_update_trial
-    # ─────────────────────────────────────────────────────────────────────────
 
     seed_everything(seed)
     if mode == 'offline':
