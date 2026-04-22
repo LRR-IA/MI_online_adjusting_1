@@ -344,19 +344,113 @@ def Online_updating_EEGNet_simulation(args_dict):
 
     # this is the implementation of paper
     # Ding, Y., Udompanyawit, C., Zhang, Y., & He, B. (2025). EEG-based brain-computer interface enables real-time robotic hand control at individual finger level. Nature communications, 16(1), 5401. https://doi.org/10.1038/s41467-025-61064-x
+    # =========================================================================
+    # NC论文复现：在线finetune + retrain 配置
+    # 结构说明：
+    #   每个session = 12个trial，每个trial = 9个segments（batch_size_online=9）
+    # 触发逻辑：
+    #   - session内前6个trial完成后 → mid-session finetune
+    #       仅用当前session前6个trial的在线数据，冻结firstConv+depthwiseConv
+    #       lr=0.0001，epoch≤100，早停patience=80
+    #   - 每个完整session（12个trial）结束后 → full retrain
+    #       用离线数据全部 + 所有历史在线trial数据，全参数更新
+    #       lr=0.001，epoch≤300，早停patience=80
+    #   - 训练/验证集均按trial级别8:2随机划分（绝不按segment划分，防数据泄露）
+    # =========================================================================
+    TRIALS_PER_SESSION = 12      # 每个session包含的trial数
+    FINETUNE_TRIGGER   = 6       # session内触发finetune的trial数（前半session）
+    FINETUNE_LR        = 0.0001  # finetune学习率（原论文低10倍）
+    FINETUNE_DROPOUT   = 0.65    # finetune dropout（防小数据集过拟合，原论文设定）
+    FINETUNE_EPOCHS    = 64      # finetune最大epoch上限
+    FINETUNE_PATIENCE  = 32      # finetune早停patience
+    RETRAIN_LR         = 0.001   # retrain学习率
+    RETRAIN_DROPOUT    = 0.5     # retrain dropout（原论文 Orig 模式固定为0.5）
+    RETRAIN_EPOCHS     = 100     # retrain最大epoch上限
+    RETRAIN_PATIENCE   = 50     # retrain早停patience
+
+    # EEGNetFea 的 named_children() 共4个顶层模块：
+    #   firstConv     → Conv2d(时域卷积) + BN2d         → finetune时冻结
+    #   depthwiseConv → DepthwiseConv + BN2d + ELU + Pool + Dropout → finetune时冻结
+    #   separableConv → SeparableConv + BN2d + ELU + Pool + Dropout → finetune时可更新
+    #   classifier    → Flatten + Linear                → finetune时可更新
+    if args_dict.model_type in ['EEGNetFea', 'EEGNet']:
+        # 冻结时域卷积(firstConv: Conv2d+BN) + 空域卷积(depthwiseConv: DepthwiseConv+BN+ELU+Pool+Dropout)
+        # 对应原论文 Keras EEGNet 冻结前4个有参数层（Conv2D+BN+DepthwiseConv2D+BN）
+        # ELU/Pool/Dropout 无参数，按模块名冻结与原论文等价
+        FREEZE_MODULES = {'firstConv', 'depthwiseConv'}
+    elif args_dict.model_type in ['DeepConvNetFea', 'DeepConvNet']:
+        # DeepConvNetFea: block1 = Conv2d(时域) + Conv2d(空域) + BN + ELU + MaxPool
+        # block1 对应 EEGNet 的 firstConv+depthwiseConv，是跨session最稳定的低层特征
+        # block2/block3/block4/classifier 对应高层融合层+分类头，finetune时可更新
+        FREEZE_MODULES = {'block1'}
+    elif args_dict.model_type in ['ShallowConvNetFea', 'ShallowConvNet']:
+        # ShallowConvNetFea: block1 = Conv2d(时域) + Conv2d(空域) + BN
+        # 整体极浅（仅block1+pool+drop+classifier），block1是唯一的低层特征提取模块
+        # pool/drop无参数，classifier对漂移敏感，finetune时只更新classifier
+        FREEZE_MODULES = {'block1'}
+
+    # 记录初始离线数据的segment数，用于retrain时区分离线/在线部分
+    # combined_feature_array在函数入口处已初始化为离线数据
+    n_offline_segs_init = combined_feature_array.shape[0]
+
+    # base_model_state_dict：每个session开始时的Base Model权重
+    # 前半段(trial 1-6)用Base Model推理，后半段(trial 7-12)用Fine-tuned Model推理
+    # 第一个session的Base Model = 离线训练好的权重（已在函数入口加载）
+    base_model_state_dict = copy.deepcopy(model.state_dict())
+    # finetuned_state_dict：每个session前半段结束后finetune得到的权重
+    finetuned_state_dict = None
+
     for trial_idx in range(trial_nums):
         # generate the new data, simulating the online experiment 
         sub_train_feature_batches = sub_train_feature_array_1[trial_idx * batch_size_online : (trial_idx + 1) * batch_size_online, :, :]
         sub_train_label_batches = sub_train_label_array_1[trial_idx * batch_size_online : (trial_idx + 1) * batch_size_online]
-        
+
+        # 将当前trial的在线数据累积进combined数组
+        # 累积后：combined_feature_array = 离线数据(初始) + 所有历史在线trial数据(segment级别)
+        combined_feature_array = np.concatenate((combined_feature_array, sub_train_feature_batches), axis=0)
+        combined_label_array   = np.concatenate((combined_label_array,   sub_train_label_batches),   axis=0)
+        unique_labels = np.unique(combined_label_array)
+
+        # 计算当前trial在session内的局部位置（1-based，范围1~TRIALS_PER_SESSION）
+        # 必须在推理前计算，以决定使用哪个模型权重
+        trial_in_session = (trial_idx % TRIALS_PER_SESSION) + 1
+
+        # -----------------------------------------------------------------------
+        # 对应原论文在线逻辑：
+        #   前半段 (trial_in_session 1~6)  → 使用当前session的 Base Model 推理
+        #   后半段 (trial_in_session 7~12) → 使用 Fine-tuned Model 推理
+        #   session开始(trial_in_session=1)时，加载该session的Base Model权重
+        # -----------------------------------------------------------------------
+        # -----------------------------------------------------------------------
+        # 对应原论文在线推理逻辑：
+        #   session开始(trial_in_session=1)时切换到新的Base Model
+        #   前半段 (trial_in_session 1~6)  → Base Model 推理（不重复load，session开始时load一次）
+        #   后半段 (trial_in_session 7~12) → Fine-tuned Model 推理（finetune触发后即切换）
+        # -----------------------------------------------------------------------
+        if trial_in_session == 1:
+            # 新session开始：切换到该session的Base Model（retrain结束后已更新）
+            model.load_state_dict(copy.deepcopy(base_model_state_dict))
+            model = model.to(device)
+            print('[Session {}] New session started, loaded Base Model weights.'.format(
+                trial_idx // TRIALS_PER_SESSION + 1))
+        elif trial_in_session == FINETUNE_TRIGGER + 1:
+            # 后半段开始（trial_in_session=7）：切换到Fine-tuned Model
+            # finetune已在trial_in_session=6推理结束后完成并保存
+            if finetuned_state_dict is not None:
+                model.load_state_dict(copy.deepcopy(finetuned_state_dict))
+                model = model.to(device)
+                print('[Session {}] Switching to Fine-tuned Model at trial_in_session={}.'.format(
+                    trial_idx // TRIALS_PER_SESSION + 1, trial_in_session))
+            else:
+                # 理论上不应发生（finetune在trial_in_session=6时一定已触发）
+                print('[Warning] finetuned_state_dict is None at trial_in_session=7, using Base Model.')
+        # 其余trial（2~6前半段，8~12后半段）模型权重不变，沿用上一trial的模型
 
         # online simulation trials
         print("********** Online simulation trial: {} ***********".format(trial_idx))
         start_time_infer = time.time()
-        if (trial_idx+1) > update_trial:
-            model.load_state_dict(torch.load(os.path.join(result_save_subject_checkpointdir, 'best_model.pt')))  
-
         model = model.to(device)
+        model.eval()
         # online testing of the MI class
         ground_truth_label = np.unique(sub_train_label_batches)
         print("ground truth label:{}".format(ground_truth_label))
@@ -390,29 +484,340 @@ def Online_updating_EEGNet_simulation(args_dict):
             print(accuracy_per_class_iter)
             accuracy_per_class_iter_Rest = compute_total_accuracy_per_class(accuracies_per_class_iterations_Rest)
 
-        # online model updating
-        if (trial_idx + 1) % update_trial == 0:           
-            print("******* Updating the model trial: {} ************".format(trial_idx))
+        # =========================================================================
+        # NC论文复现：在线finetune + retrain 双触发机制
+        # =========================================================================
+        # trial_in_session 已在推理前计算，此处直接使用
+
+        experiment_name = 'lr{}_dropout{}'.format(lr, dropout)
+        result_save_subjectdir = os.path.join(Online_result_save_rootdir, sub_name, experiment_name)
+        result_save_subject_checkpointdir = os.path.join(result_save_subjectdir, 'checkpoint')
+        makedir_if_not_exist(result_save_subjectdir)
+        makedir_if_not_exist(result_save_subject_checkpointdir)
+
+        # -----------------------------------------------------------------------
+        # 触发条件1：session内前6个trial完成 → Mid-session Finetune
+        #   对应原论文：用当天前半段（Run 1-8）数据微调模型
+        #   冻结 firstConv + depthwiseConv（时域/空域卷积，跨session稳定）
+        #   只更新 separableConv + classifier（融合层+分类头，对漂移最敏感）
+        #   lr=0.0001，epoch≤100，早停patience=80（监控val_loss），保存val_accuracy最高权重
+        # -----------------------------------------------------------------------
+        if trial_in_session == FINETUNE_TRIGGER:
+            print("******* [NC-Finetune] Mid-session finetune triggered at trial: {} "
+                  "(session内第{}/{}个trial) ************".format(
+                      trial_idx, trial_in_session, TRIALS_PER_SESSION))
             start_time = time.time()
-            experiment_name = 'lr{}_dropout{}'.format(lr, dropout)#experiment name: used for indicating hyper setting
-            # print(experiment_name)
-            #derived arg
-            result_save_subjectdir = os.path.join(Online_result_save_rootdir, sub_name, experiment_name)
-            result_save_subject_checkpointdir = os.path.join(result_save_subjectdir, 'checkpoint')
 
-            makedir_if_not_exist(result_save_subjectdir)
-            makedir_if_not_exist(result_save_subject_checkpointdir)
+            # 从当前session的 Base Model 权重出发做finetune（对应原论文逻辑）
+            # 原论文finetune时dropout=0.65（大于Orig的0.5），防止小数据集过拟合
+            # 需重新实例化模型（以应用新的dropout率），再加载Base Model权重
+            if args_dict.model_type in ['EEGNetFea', 'EEGNet']:
+                model = EEGNetFea(feature_size=input_feature_size, num_timesteps=512,
+                                  num_classes=3, F1=8, D=2, F2=16, dropout=FINETUNE_DROPOUT)
+            elif args_dict.model_type in ['DeepConvNetFea', 'DeepConvNet']:
+                model = DeepConvNetFea(feature_size=input_feature_size, num_timesteps=512,
+                                       num_classes=3, dropout=FINETUNE_DROPOUT)
+            elif args_dict.model_type in ['ShallowConvNetFea', 'ShallowConvNet']:
+                model = ShallowConvNetFea(feature_size=input_feature_size, num_timesteps=512,
+                                          num_classes=3, dropout=FINETUNE_DROPOUT)
+            model.load_state_dict(copy.deepcopy(base_model_state_dict))
+            model = model.to(device)
+            print('[NC-Finetune] Loaded Base Model weights with FINETUNE_DROPOUT={}.'.format(FINETUNE_DROPOUT))
 
-            # =========================================================================================================
-            # model updating after each session
+            # 收集当前session前FINETUNE_TRIGGER个trial的在线数据
+            # session第1个trial的全局索引 = trial_idx - (FINETUNE_TRIGGER - 1)
+            session_start_trial_idx = trial_idx - (FINETUNE_TRIGGER - 1)
+            ft_online_features_list = []
+            ft_online_labels_list   = []
+            for t in range(session_start_trial_idx, trial_idx + 1):
+                ft_online_features_list.append(
+                    sub_train_feature_array_1[t * batch_size_online : (t + 1) * batch_size_online])
+                ft_online_labels_list.append(
+                    sub_train_label_array_1[t * batch_size_online : (t + 1) * batch_size_online])
+            ft_online_features = np.concatenate(ft_online_features_list, axis=0)
+            # shape: (FINETUNE_TRIGGER * batch_size_online, C, T) = (6*9=54, C, T)
+            ft_online_labels   = np.concatenate(ft_online_labels_list,   axis=0)
 
-            # Saving model
-            torch.save(model.state_dict(), os.path.join(result_save_subject_checkpointdir, 'best_model.pt'))
-            # =========================================================================================================
+            # 按trial级别8:2随机划分（每trial含batch_size_online=9个segments）
+            # 绝不按segment划分，防止同一trial的不同segment分别出现在train和val（数据泄露）
+            n_ft_trials = FINETUNE_TRIGGER  # = 6
+            shuffled_ft_idx = np.random.permutation(n_ft_trials)
+            n_ft_train      = int(0.8 * n_ft_trials)  # 4个trial → train
+            ft_train_trial_idx = shuffled_ft_idx[:n_ft_train]
+            ft_val_trial_idx   = shuffled_ft_idx[n_ft_train:]
+
+            ft_train_features = np.concatenate(
+                [ft_online_features[i * batch_size_online : (i + 1) * batch_size_online]
+                 for i in ft_train_trial_idx], axis=0)
+            ft_train_labels   = np.concatenate(
+                [ft_online_labels[i * batch_size_online : (i + 1) * batch_size_online]
+                 for i in ft_train_trial_idx], axis=0)
+            ft_val_features   = np.concatenate(
+                [ft_online_features[i * batch_size_online : (i + 1) * batch_size_online]
+                 for i in ft_val_trial_idx], axis=0)
+            ft_val_labels     = np.concatenate(
+                [ft_online_labels[i * batch_size_online : (i + 1) * batch_size_online]
+                 for i in ft_val_trial_idx], axis=0)
+
+            ft_train_set    = brain_dataset(ft_train_features, ft_train_labels)
+            ft_val_set      = brain_dataset(ft_val_features,   ft_val_labels)
+            ft_train_loader = torch.utils.data.DataLoader(
+                ft_train_set, batch_size=batch_size, shuffle=True)
+            ft_val_loader   = torch.utils.data.DataLoader(
+                ft_val_set,   batch_size=batch_size, shuffle=False)
+
+            # 冻结 firstConv 和 depthwiseConv，只更新 separableConv 和 classifier
+            # EEGNetFea named_children(): firstConv / depthwiseConv / separableConv / classifier
+            for name, param in model.named_parameters():
+                top_module_name = name.split('.')[0]
+                if top_module_name in FREEZE_MODULES:
+                    param.requires_grad = False
+                else:
+                    param.requires_grad = True
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            print('[NC-Finetune] Frozen modules: {}'.format(FREEZE_MODULES))
+            print('[NC-Finetune] Trainable param count: {}'.format(
+                sum(p.numel() for p in trainable_params)))
+
+            ft_criterion  = nn.CrossEntropyLoss()
+            ft_optimizer  = torch.optim.Adam(trainable_params, lr=FINETUNE_LR)
+            ft_scheduler  = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                ft_optimizer, mode='min', factor=0.5, patience=30)
+
+            ft_best_val_acc = 0.0
+            ft_best_state   = copy.deepcopy(model.state_dict())
+            ft_no_improve   = 0  # 监控val_loss连续无改善epoch数（用于早停）
+            ft_best_val_loss = float('inf')
+
+            for ft_epoch in range(FINETUNE_EPOCHS):
+                # --- train one epoch ---
+                model.train()
+                for xb, yb in ft_train_loader:
+                    xb, yb = xb.to(device), yb.to(device).long()
+                    ft_optimizer.zero_grad()
+                    out, _ = model(xb)  # EEGNetFea forward返回 (logits, features)
+                    loss = ft_criterion(out, yb)
+                    loss.backward()
+                    ft_optimizer.step()
+
+                # --- validate ---
+                model.eval()
+                ft_val_correct  = 0
+                ft_val_total    = 0
+                ft_val_loss_sum = 0.0
+                with torch.no_grad():
+                    for xb, yb in ft_val_loader:
+                        xb, yb = xb.to(device), yb.to(device).long()
+                        out, _ = model(xb)
+                        loss = ft_criterion(out, yb)
+                        ft_val_loss_sum += loss.item() * xb.size(0)
+                        preds = out.argmax(dim=1)
+                        ft_val_correct += (preds == yb).sum().item()
+                        ft_val_total   += xb.size(0)
+                ft_val_acc  = ft_val_correct / ft_val_total * 100.0
+                ft_val_loss = ft_val_loss_sum / ft_val_total
+                ft_scheduler.step(ft_val_loss)
+
+                # 保存val_accuracy最高的权重（原论文：save_best_only=True，监控val_accuracy）
+                if ft_val_acc >= ft_best_val_acc:
+                    ft_best_val_acc = ft_val_acc
+                    ft_best_state   = copy.deepcopy(model.state_dict())
+
+                # 早停监控val_loss（patience=80，原论文设定）
+                if ft_val_loss < ft_best_val_loss:
+                    ft_best_val_loss = ft_val_loss
+                    ft_no_improve    = 0
+                else:
+                    ft_no_improve += 1
+                if ft_no_improve >= FINETUNE_PATIENCE:
+                    print('[NC-Finetune] Early stopping at epoch {}, '
+                          'best val acc: {:.2f}%'.format(ft_epoch, ft_best_val_acc))
+                    break
+
+            # 加载val_accuracy最高的权重（而非最后epoch或早停时的权重）
+            model.load_state_dict(ft_best_state)
+            finetuned_state_dict = copy.deepcopy(ft_best_state)
+            torch.save(finetuned_state_dict,
+                       os.path.join(result_save_subject_checkpointdir, 'best_model.pt'))
+            print('[NC-Finetune] Done. Best val acc: {:.2f}%. Model saved.'.format(
+                ft_best_val_acc))
+
+            # 解冻所有层，恢复正常状态供后续推理使用
+            # 注意：eval()模式下dropout不激活，无需为推理专门切换dropout率
+            # finetuned_state_dict已保存finetune最优权重，后续推理通过load_state_dict使用
+            for param in model.parameters():
+                param.requires_grad = True
+            model = model.to(device)
+            model.eval()  # 切回eval模式，dropout在推理时自动关闭
 
             end_time = time.time()
-            total_time = end_time - start_time
-            write_program_time(os.path.join(Online_result_save_rootdir, sub_name), total_time)
+            write_program_time(os.path.join(Online_result_save_rootdir, sub_name),
+                               end_time - start_time)
+
+        # -----------------------------------------------------------------------
+        # 触发条件2：一个完整session（12个trial）结束 → Full Retrain
+        #   对应原论文：Session结束后用"离线数据全部 + 所有历史在线数据"重训练
+        #   全参数更新（不冻结任何层），lr=0.001，epoch≤300，早停patience=80
+        #   训练/验证集按trial级别8:2随机划分（在线部分），离线部分全部入训练集
+        # -----------------------------------------------------------------------
+        if (trial_idx + 1) % TRIALS_PER_SESSION == 0:
+            print("******* [NC-Retrain] Full retrain triggered at session end, "
+                  "trial: {} ************".format(trial_idx))
+            start_time = time.time()
+
+            # combined_feature_array此时 = 离线数据（初始n_offline_segs_init个segments）
+            #                             + 所有历史在线trial数据（segment级别，逐trial累积）
+            # 在线部分的segment总数 = 已完成trial数 * batch_size_online
+            n_online_segs_total = (trial_idx + 1) * batch_size_online
+            # 再次确认离线部分大小（与初始化时一致）
+            n_offline_segs = combined_feature_array.shape[0] - n_online_segs_total
+            # 注意：n_offline_segs 应等于 n_offline_segs_init，此处做断言保护
+            assert n_offline_segs == n_offline_segs_init, \
+                "[NC-Retrain] n_offline_segs mismatch: {} vs {}".format(
+                    n_offline_segs, n_offline_segs_init)
+
+            # 新代码：对应原论文 train_models() 逻辑
+            # 离线数据 + 在线数据在 trial 级别混合，整体做 8:2 随机划分，防数据泄露
+            # 离线部分：将其视为若干个"trial块"，每块大小同样为 batch_size_online 个 segments
+            # 注意：n_offline_segs 可能不能被 batch_size_online 整除，需做整除处理
+            offline_feat = combined_feature_array[:n_offline_segs]
+            offline_lbl  = combined_label_array[:n_offline_segs]
+            online_all_feat = combined_feature_array[n_offline_segs:]
+            online_all_lbl  = combined_label_array[n_offline_segs:]
+
+            # 将离线数据按 3 切成 trial 块（尾部不足一块的丢弃，保持 trial 粒度一致）
+            OFFLINE_WINDOW_PER_TRIAL = 3  # 离线数据每trial切出3个sliding window
+            n_offline_trials = n_offline_segs // OFFLINE_WINDOW_PER_TRIAL
+            offline_feat_trimmed = offline_feat[:n_offline_trials * OFFLINE_WINDOW_PER_TRIAL]
+            offline_lbl_trimmed  = offline_lbl[:n_offline_trials * OFFLINE_WINDOW_PER_TRIAL]
+
+            # 在线部分 trial 数
+            n_online_trials = trial_idx + 1  # 已完成的在线 trial 总数
+
+            # 将离线 trial 块和在线 trial 块统一编号，混合后整体做 8:2 随机划分
+            # trial 索引：0 ~ n_offline_trials-1 为离线，n_offline_trials ~ n_total_trials-1 为在线
+            n_total_trials = n_offline_trials + n_online_trials
+            shuffled_all_idx = np.random.permutation(n_total_trials)
+            n_total_train    = int(0.8 * n_total_trials)
+            all_train_idx    = shuffled_all_idx[:n_total_train]
+            all_val_idx      = shuffled_all_idx[n_total_train:]
+
+            # 改动2：get_segs_by_trial_idx中离线部分步长也用OFFLINE_WINDOW_PER_TRIAL
+            def get_segs_by_trial_idx(trial_i):
+                if trial_i < n_offline_trials:
+                    start = trial_i * OFFLINE_WINDOW_PER_TRIAL  # ← 改这里
+                    end   = start + OFFLINE_WINDOW_PER_TRIAL    # ← 改这里
+                    return offline_feat_trimmed[start:end], offline_lbl_trimmed[start:end]
+                else:
+                    online_i = trial_i - n_offline_trials
+                    start = online_i * batch_size_online
+                    end   = start + batch_size_online
+                    return online_all_feat[start:end], online_all_lbl[start:end]
+
+            rt_train_feat = np.concatenate([get_segs_by_trial_idx(i)[0] for i in all_train_idx], axis=0)
+            rt_train_lbl  = np.concatenate([get_segs_by_trial_idx(i)[1] for i in all_train_idx], axis=0)
+            rt_val_feat   = np.concatenate([get_segs_by_trial_idx(i)[0] for i in all_val_idx],   axis=0)
+            rt_val_lbl    = np.concatenate([get_segs_by_trial_idx(i)[1] for i in all_val_idx],   axis=0)
+
+            rt_train_set    = brain_dataset(rt_train_feat, rt_train_lbl)
+            rt_val_set      = brain_dataset(rt_val_feat,   rt_val_lbl)
+            rt_train_loader = torch.utils.data.DataLoader(
+                rt_train_set, batch_size=batch_size, shuffle=True)
+            rt_val_loader   = torch.utils.data.DataLoader(
+                rt_val_set,   batch_size=batch_size, shuffle=False)
+
+            # 原论文 Orig 模式：从随机初始化出发，dropout固定为0.5（RETRAIN_DROPOUT）
+            # 不沿用离线超参搜索的dropout值，以保持与原论文一致
+            if preprocess_norm:
+                input_feature_size = 30
+            else:
+                input_feature_size = 29
+            if args_dict.model_type in ['EEGNetFea', 'EEGNet']:
+                model = EEGNetFea(feature_size=input_feature_size, num_timesteps=512,
+                                  num_classes=3, F1=8, D=2, F2=16, dropout=RETRAIN_DROPOUT)
+            elif args_dict.model_type in ['DeepConvNetFea', 'DeepConvNet']:
+                model = DeepConvNetFea(feature_size=input_feature_size, num_timesteps=512,
+                                       num_classes=3, dropout=RETRAIN_DROPOUT)
+            elif args_dict.model_type in ['ShallowConvNetFea', 'ShallowConvNet']:
+                model = ShallowConvNetFea(feature_size=input_feature_size, num_timesteps=512,
+                                          num_classes=3, dropout=RETRAIN_DROPOUT)
+            for param in model.parameters():
+                param.requires_grad = True
+            model = model.to(device)
+            print('[NC-Retrain] Model re-initialized from random weights with RETRAIN_DROPOUT={}.'.format(RETRAIN_DROPOUT))
+
+            rt_criterion = nn.CrossEntropyLoss()
+            rt_optimizer = torch.optim.Adam(model.parameters(), lr=RETRAIN_LR)
+            rt_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                rt_optimizer, mode='min', factor=0.5, patience=30)
+
+            rt_best_val_acc  = 0.0
+            rt_best_state    = copy.deepcopy(model.state_dict())
+            rt_no_improve    = 0  # 监控val_loss连续无改善epoch数（用于早停）
+            rt_best_val_loss = float('inf')
+
+            for rt_epoch in trange(RETRAIN_EPOCHS, desc='[NC-Retrain] Full retrain'):
+                # --- train one epoch ---
+                model.train()
+                for xb, yb in rt_train_loader:
+                    xb, yb = xb.to(device), yb.to(device).long()
+                    rt_optimizer.zero_grad()
+                    out, _ = model(xb)  # EEGNetFea forward返回 (logits, features)
+                    loss = rt_criterion(out, yb)
+                    loss.backward()
+                    rt_optimizer.step()
+
+                # --- validate ---
+                model.eval()
+                rt_val_correct  = 0
+                rt_val_total    = 0
+                rt_val_loss_sum = 0.0
+                with torch.no_grad():
+                    for xb, yb in rt_val_loader:
+                        xb, yb = xb.to(device), yb.to(device).long()
+                        out, _ = model(xb)
+                        loss = rt_criterion(out, yb)
+                        rt_val_loss_sum += loss.item() * xb.size(0)
+                        preds = out.argmax(dim=1)
+                        rt_val_correct += (preds == yb).sum().item()
+                        rt_val_total   += xb.size(0)
+                rt_val_acc  = rt_val_correct / rt_val_total * 100.0
+                rt_val_loss = rt_val_loss_sum / rt_val_total
+                rt_scheduler.step(rt_val_loss)
+
+                # 保存val_accuracy最高的权重
+                if rt_val_acc >= rt_best_val_acc:
+                    rt_best_val_acc = rt_val_acc
+                    rt_best_state   = copy.deepcopy(model.state_dict())
+
+                # 早停监控val_loss（patience=80）
+                if rt_val_loss < rt_best_val_loss:
+                    rt_best_val_loss = rt_val_loss
+                    rt_no_improve    = 0
+                else:
+                    rt_no_improve += 1
+                if rt_no_improve >= RETRAIN_PATIENCE:
+                    print('[NC-Retrain] Early stopping at epoch {}, '
+                          'best val acc: {:.2f}%'.format(rt_epoch, rt_best_val_acc))
+                    break
+
+            # 加载val_accuracy最高的权重
+            model.load_state_dict(rt_best_state)
+            # 更新 base_model_state_dict：下一个session的Base Model = 本次retrain最优权重
+            base_model_state_dict = copy.deepcopy(rt_best_state)
+            # finetuned_state_dict 重置为None，等待下一个session的finetune
+            finetuned_state_dict = None
+            torch.save(base_model_state_dict,
+                       os.path.join(result_save_subject_checkpointdir, 'best_model.pt'))
+            print('[NC-Retrain] Done. Best val acc: {:.2f}%. Base Model updated for next session.'.format(
+                rt_best_val_acc))
+            model = model.to(device)
+            model.eval()
+
+            end_time = time.time()
+            write_program_time(os.path.join(Online_result_save_rootdir, sub_name),
+                               end_time - start_time)
+        # =========================================================================
     
     accuracy_save2csv(predict_accuracies, result_save_subjectdir, filename='predict_accuracies.csv', columns=['Accuracy'])
     accuracy_save2csv(class_predictions_arrays, result_save_subjectdir, filename='class_predictions_arrays.csv', columns=['class_predictions_arrays'])
@@ -450,8 +855,8 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size_online', default=4, type=int, help="number of batch size for online updating")
     parser.add_argument('--trial_pre', default=120, type=int, help="number of samples each class for offline training")
     parser.add_argument('--trial_nums', default=40, type=int, help="number of trails of samples for online updating")
-    parser.add_argument('--update_trial', default=15, type=int, help="number of trails for instant updating")
-    parser.add_argument('--update_wholeModel', default=15, type=int, help="number of trails for longer updating")
+    parser.add_argument('--update_trial', default=1, type=int, help="number of trails for instant updating")
+    parser.add_argument('--update_wholeModel', default=12, type=int, help="number of trails for longer updating")
     parser.add_argument('--alpha_distill', default=0.5, type=float, help="alpha of the distillation and cls loss func")
     parser.add_argument('--para_m', default=0.99, type=float, help="hyper parameter for momentum updating")
     parser.add_argument('--cons_rate', default=0.01, type=float, help="hyper parameter for constractive loss")
